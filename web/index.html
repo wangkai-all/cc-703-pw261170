@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>并发批次发布实验台 · 谓词读集合与原子提交</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --baseline: #c3c2b7; --ring: rgba(11,11,11,.10);
+  --blue: #2a78d6; --orange: #eb6834; --aqua: #1baf7a; --yellow: #eda100; --red: #e34948;
+  --good: #0ca30c; --warning: #b07d00; --serious: #c25a2e; --critical: #d03b3b;
+  --good-wash: rgba(12,163,12,.10); --warn-wash: rgba(237,161,0,.14);
+  --crit-wash: rgba(208,59,59,.10); --info-wash: rgba(42,120,214,.10);
+  --shadow: 0 1px 3px rgba(11,11,11,.07);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --baseline: #383835; --ring: rgba(255,255,255,.10);
+    --blue: #3987e5; --orange: #d95926; --aqua: #199e70; --yellow: #c98500; --red: #e66767;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #e66767;
+    --good-wash: rgba(12,163,12,.16); --warn-wash: rgba(250,178,25,.14);
+    --crit-wash: rgba(230,103,103,.14); --info-wash: rgba(57,135,229,.16);
+    --shadow: 0 1px 3px rgba(0,0,0,.4);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header { padding: 20px 28px 12px; border-bottom: 1px solid var(--grid); background: var(--surface); }
+h1 { font-size: 19px; margin: 0 0 4px; }
+header p { margin: 0; color: var(--ink-2); font-size: 13px; }
+main { max-width: 1240px; margin: 0 auto; padding: 20px 24px 60px; }
+.grid { display: grid; gap: 16px; }
+.cols-2 { grid-template-columns: 1fr 1fr; }
+@media (max-width: 980px) { .cols-2 { grid-template-columns: 1fr; } }
+.card {
+  background: var(--surface); border: 1px solid var(--ring);
+  border-radius: 10px; padding: 16px 18px; box-shadow: var(--shadow);
+}
+.card h2 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+.card h2 .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+button, select, input {
+  font: inherit; color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--ring); border-radius: 7px; padding: 7px 12px; cursor: pointer;
+}
+button.primary { background: var(--blue); color: #fff; border-color: transparent; }
+button.danger { background: var(--crit-wash); color: var(--critical); }
+button:disabled { opacity: .45; cursor: default; }
+label.field { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px;
+  border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.pill::before { font-size: 12px; }
+.pill.accepted { background: var(--good-wash); color: var(--good); }
+.pill.accepted::before { content: "✓"; }
+.pill.rejected_recompute { background: var(--warn-wash); color: var(--warning); }
+.pill.rejected_recompute::before { content: "↻"; }
+.pill.rejected_manual { background: var(--crit-wash); color: var(--critical); }
+.pill.rejected_manual::before { content: "✕"; }
+.pill.neutral { background: var(--info-wash); color: var(--blue); }
+.pill.neutral::before { content: "•"; }
+.pill.unsafe { background: var(--crit-wash); color: var(--critical); }
+.timeline { list-style: none; margin: 0; padding: 0; }
+.timeline li {
+  display: grid; grid-template-columns: 34px 92px 1fr; gap: 10px;
+  padding: 8px 4px; border-bottom: 1px solid var(--grid); align-items: start;
+}
+.timeline .seq { color: var(--muted); font-variant-numeric: tabular-nums; }
+.timeline .actor { color: var(--ink-2); font-size: 12px; }
+.kind-tag {
+  display: inline-block; min-width: 56px; text-align: center; padding: 1px 7px;
+  border-radius: 5px; font-size: 11px; font-weight: 700; margin-right: 7px;
+}
+.kind-stage { background: var(--info-wash); color: var(--blue); }
+.kind-commit { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--ring); }
+.kind-snapshot, .kind-reset { background: var(--surface-2); color: var(--muted); }
+.kind-retry { background: var(--warn-wash); color: var(--warning); }
+.detail { color: var(--ink-2); font-size: 12.5px; }
+.detail code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+.evidence { margin: 6px 0 0; padding-left: 18px; }
+.evidence li { font-size: 12.5px; color: var(--ink-2); display: list-item; border: none; padding: 2px 0; grid-template-columns: none; }
+.readset {
+  font-size: 12px; background: var(--surface-2); border-radius: 8px;
+  padding: 10px 12px; margin-top: 8px; overflow-x: auto;
+}
+.readset pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.cap-meter { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; min-width: 90px; }
+.cap-meter > i { display: block; height: 100%; border-radius: 999px; }
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px; }
+.tile { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
+.tile .k { font-size: 11.5px; color: var(--muted); }
+.tile .v { font-size: 21px; font-weight: 650; margin-top: 2px; }
+.tile .v.good { color: var(--good); } .tile .v.warn { color: var(--warning); }
+.tile .v.crit { color: var(--critical); }
+.bars { display: flex; gap: 36px; align-items: flex-end; height: 190px; padding: 12px 8px 0; border-bottom: 1px solid var(--baseline); }
+.bar-col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; flex: 0 0 130px; }
+.bar { width: 24px; border-radius: 4px 4px 0 0; position: relative; transition: height .4s ease; }
+.bar.serial { background: var(--orange); } .bar.concurrent { background: var(--blue); }
+.bar .vlabel { position: absolute; top: -20px; left: 50%; transform: translateX(-50%); font-size: 12px; font-weight: 650; color: var(--ink); white-space: nowrap; }
+.bar-x { margin-top: 8px; font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-2); margin: 8px 0; }
+.toast {
+  position: fixed; right: 22px; bottom: 22px; max-width: 420px; z-index: 50;
+  background: var(--surface); border: 1px solid var(--ring); border-radius: 9px;
+  box-shadow: 0 6px 22px rgba(0,0,0,.18); padding: 12px 15px; font-size: 13px;
+  opacity: 0; transform: translateY(8px); transition: all .25s; pointer-events: none;
+}
+.toast.show { opacity: 1; transform: none; }
+.toast.err { border-color: var(--critical); }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.switch { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; }
+.switch button { border: none; border-radius: 0; padding: 7px 14px; }
+.switch button.on { background: var(--blue); color: #fff; }
+.switch button.on.unsafe { background: var(--critical); }
+.write-row { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; margin-bottom: 8px; }
+.section-gap { margin-top: 26px; }
+.small { font-size: 12px; }
+details summary { cursor: pointer; color: var(--ink-2); font-size: 12.5px; margin: 6px 0; }
+.badge-mode { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 700; }
+.badge-mode.region { background: var(--good-wash); color: var(--good); }
+.badge-mode.row { background: var(--crit-wash); color: var(--critical); }
+</style>
+</head>
+<body>
+<header>
+  <h1>并发批次发布实验台 <span class="muted small">谓词读集合 · 锁内原子重校验 · 幂等提交</span></h1>
+  <p>两个独立工作进程从同一快照计算更正并分别提交。观察哪些批次被接受、要求重算或必须人工调整；切换校验粒度，对照"仅行版本"为何挡不住区域合计越限。</p>
+</header>
+
+<main>
+  <div class="controls" style="margin-bottom:16px">
+    <span class="switch" role="group" aria-label="校验粒度">
+      <button id="gran-region" class="on">区域谓词 + 行版本（可串行化）</button>
+      <button id="gran-row">仅行版本（缺陷对照）</button>
+    </span>
+    <button id="btn-reset" class="danger">重置仓库到种子数据</button>
+    <span id="mode-badge" class="badge-mode region">当前：region 粒度</span>
+    <span class="muted small" style="margin-left:auto">金额为整数单位 · 约束仅支持区域求和 / 非负 / 方案存在性</span>
+  </div>
+
+  <div class="grid cols-2">
+    <section class="card">
+      <h2>事实表与区域上限 <span class="hint">查询服务实时视图</span></h2>
+      <div id="state-table"></div>
+    </section>
+
+    <section class="card">
+      <h2>提交协调器状态 <span class="hint">结果缓存保证重试幂等</span></h2>
+      <div class="tiles">
+        <div class="tile"><div class="k">整库版本</div><div class="v" id="st-version">–</div></div>
+        <div class="tile"><div class="k">提交次数</div><div class="v" id="st-commits">–</div></div>
+        <div class="tile"><div class="k">读集合冲突</div><div class="v warn" id="st-conflicts">–</div></div>
+        <div class="tile"><div class="k">锁内重校验</div><div class="v" id="st-reval">–</div></div>
+      </div>
+      <table>
+        <thead><tr><th>已发布批次（幂等缓存键）</th><th class="num">发布后版本</th><th>触及区域</th></tr></thead>
+        <tbody id="event-table"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <section class="card section-gap">
+    <h2>① 场景实验室：重放提交交错 <span class="hint">同一快照 → 按顺序提交，确定性复现</span></h2>
+    <div class="controls" style="margin-bottom:12px">
+      <label class="field">场景
+        <select id="scenario-select"></select>
+      </label>
+      <label class="field">计算延迟(ms) <input id="scn-delay" type="number" value="50" min="0" step="10" style="width:90px"></label>
+      <button class="primary" id="btn-run-scn">重放场景</button>
+      <button id="btn-run-scn-row">用「仅行版本」重放（对照）</button>
+    </div>
+    <p id="scn-desc" class="small muted" style="margin:0 0 10px"></p>
+    <div id="scn-summary" class="tiles"></div>
+    <ul class="timeline" id="scn-timeline"></ul>
+  </section>
+
+  <section class="card section-gap">
+    <h2>② 手动工作台：两批更正从同一快照并发提交 <span class="hint">真实线程 + 屏障起跑</span></h2>
+    <div class="grid cols-2">
+      <div>
+        <strong class="small">工作进程 1 · 批次 A</strong>
+        <div class="write-row" style="margin-top:8px">
+          <input id="a-region" value="R1" aria-label="A 区域">
+          <input id="a-plan" value="P101" aria-label="A 方案">
+          <input id="a-amount" type="number" value="60" aria-label="A 金额">
+          <button data-write="a" class="small">加入</button>
+        </div>
+        <ul id="a-writes" class="mono small" style="min-height:26px;margin:4px 0;padding-left:18px"></ul>
+      </div>
+      <div>
+        <strong class="small">工作进程 2 · 批次 B</strong>
+        <div class="write-row" style="margin-top:8px">
+          <input id="b-region" value="R1" aria-label="B 区域">
+          <input id="b-plan" value="P102" aria-label="B 方案">
+          <input id="b-amount" type="number" value="45" aria-label="B 金额">
+          <button data-write="b" class="small">加入</button>
+        </div>
+        <ul id="b-writes" class="mono small" style="min-height:26px;margin:4px 0;padding-left:18px"></ul>
+      </div>
+    </div>
+    <div class="controls" style="margin-top:6px">
+      <button class="primary" id="btn-parallel">同快照并发提交 A/B</button>
+      <button id="btn-lost">模拟响应丢失：A 提交后同 ID 重试</button>
+      <button id="btn-clear-writes">清空写集合</button>
+    </div>
+    <div id="manual-out"></div>
+  </section>
+
+  <section class="card section-gap">
+    <h2>③ 吞吐对照：串行基线 vs 并发提交 <span class="hint">同一工作负载；计算延迟在提交锁外重叠</span></h2>
+    <div class="controls" style="margin-bottom:10px">
+      <label class="field">批次数 <input id="bm-n" type="number" value="20" min="2" max="200" style="width:80px"></label>
+      <label class="field">计算延迟(ms) <input id="bm-delay" type="number" value="20" min="0" step="5" style="width:90px"></label>
+      <label class="field">并发进程 <input id="bm-workers" type="number" value="4" min="1" max="16" style="width:70px"></label>
+      <label class="field">额度压力 <input id="bm-pressure" type="number" value="0.5" min="0" max="1" step="0.1" style="width:70px"></label>
+      <label class="field">随机种子 <input id="bm-seed" type="number" value="42" style="width:80px"></label>
+      <button class="primary" id="btn-bench">运行对照</button>
+    </div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--orange)"></i> 串行基线（延迟完整累加）</span>
+      <span><i class="sw" style="background:var(--blue)"></i> 并发提交（锁外计算重叠，临界区仍串行化）</span>
+    </div>
+    <div class="bars" id="bench-bars"><div class="muted small" style="align-self:center">点击「运行对照」生成</div></div>
+    <table style="margin-top:12px">
+      <thead><tr>
+        <th>模式</th><th class="num">墙钟(ms)</th><th class="num">吞吐(批/秒)</th>
+        <th class="num">接受</th><th class="num">要求重算</th><th class="num">人工拒绝</th>
+        <th class="num">冲突</th><th class="num">重校验</th><th class="num">重算后接受</th><th class="num">最终版本</th>
+      </tr></thead>
+      <tbody id="bench-table"></tbody>
+    </table>
+    <p class="small muted" style="margin-bottom:0">说明：两种模式的最终事实表版本与接受集合一致（正确性对照）；差别只在墙钟时间。可重算批次自动基于新快照重试且金额不变；人工拒绝绝不自动改小金额。</p>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
